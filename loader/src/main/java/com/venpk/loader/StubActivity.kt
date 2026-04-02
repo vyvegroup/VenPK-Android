@@ -7,6 +7,7 @@ import android.os.Bundle
 import android.util.Log
 import dalvik.system.InMemoryDexClassLoader
 import java.io.ByteArrayInputStream
+import java.nio.ByteBuffer
 import javax.crypto.Cipher
 import javax.crypto.SecretKey
 import javax.crypto.spec.GCMParameterSpec
@@ -192,10 +193,13 @@ class StubActivity : Activity() {
      */
     private fun createMemoryClassLoader(dexEntries: List<ByteArray>): ClassLoader? {
         return try {
-            // Use the first DEX as primary, with parent classloader for framework classes
-            val primaryDex = dexEntries.first()
+            // Convert ByteArray to ByteBuffer for InMemoryDexClassLoader
+            val buffers = dexEntries.map { dex ->
+                ByteBuffer.wrap(dex)
+            }
+            // Use all DEX buffers
             InMemoryDexClassLoader(
-                ByteArrayInputStream(primaryDex),
+                buffers.toTypedArray(),
                 classLoader
             )
         } catch (e: Throwable) {
