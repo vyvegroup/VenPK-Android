@@ -1,10 +1,8 @@
 package com.venpk.plugin
 
 import com.android.build.gradle.AppExtension
-import org.gradle.api.DefaultTask
 import org.gradle.api.Plugin
 import org.gradle.api.Project
-import org.gradle.api.tasks.TaskProvider
 
 class VenPKPlugin : Plugin<Project> {
 
@@ -25,18 +23,18 @@ class VenPKPlugin : Plugin<Project> {
 
             project.logger.lifecycle("[VenPK] Registering VenPK encrypt tasks for ${project.name}")
 
-            // Register encrypt task (release)
+            // Register encrypt task (release) - use configure with receiver lambda
             val encryptRelease = project.tasks.register(
                 "venpkEncryptDex",
                 VenPKEncryptTask::class.java
             )
-            encryptRelease.configure { task ->
-                task.sourceModule.set(extension.sourceModule)
-                task.assetName.set(extension.assetName)
-                task.variantName.set("release")
-                task.outputDir.set(project.layout.buildDirectory.dir("venpk/release"))
-                task.description = "Encrypts DEX files for VenPK protection (release)"
-                task.group = "venpk"
+            encryptRelease.configure {
+                sourceModule.set(extension.sourceModule)
+                assetName.set(extension.assetName)
+                variantName.set("release")
+                outputDir.set(project.layout.buildDirectory.dir("venpk/release"))
+                description = "Encrypts DEX files for VenPK protection (release)"
+                group = "venpk"
             }
 
             // Register encrypt task (debug)
@@ -44,22 +42,22 @@ class VenPKPlugin : Plugin<Project> {
                 "venpkEncryptDexDebug",
                 VenPKEncryptTask::class.java
             )
-            encryptDebug.configure { task ->
-                task.sourceModule.set(extension.sourceModule)
-                task.assetName.set(extension.assetName)
-                task.variantName.set("debug")
-                task.outputDir.set(project.layout.buildDirectory.dir("venpk/debug"))
-                task.description = "Encrypts DEX files for VenPK protection (debug)"
-                task.group = "venpk"
+            encryptDebug.configure {
+                sourceModule.set(extension.sourceModule)
+                assetName.set(extension.assetName)
+                variantName.set("debug")
+                outputDir.set(project.layout.buildDirectory.dir("venpk/debug"))
+                description = "Encrypts DEX files for VenPK protection (debug)"
+                group = "venpk"
             }
 
-            // Register helper task to copy encrypted payload to assets
+            // Register helper task: copy encrypted payload to assets
             val prepareAssets = project.tasks.register("venpkPrepareAssets")
-            prepareAssets.configure { task ->
-                task.dependsOn(encryptRelease)
-                task.description = "Copies encrypted DEX to loader assets directory"
-                task.group = "venpk"
-                task.doLast {
+            prepareAssets.configure {
+                dependsOn(encryptRelease.get())
+                description = "Copies encrypted DEX to loader assets directory"
+                group = "venpk"
+                doLast {
                     val buildDir = project.layout.buildDirectory.get().asFile
                     val payloadFile = buildDir.resolve("venpk/release/${extension.assetName}")
                     val assetsDir = project.projectDir.resolve("src/main/assets")
