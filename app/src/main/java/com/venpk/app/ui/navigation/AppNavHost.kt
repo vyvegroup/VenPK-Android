@@ -13,6 +13,7 @@ import com.venpk.app.ui.screens.AboutScreen
 import com.venpk.app.ui.screens.DetailScreen
 import com.venpk.app.ui.screens.HomeScreen
 import com.venpk.app.ui.screens.SettingsScreen
+import androidx.compose.material3.ExperimentalMaterial3Api
 
 object Routes {
     const val HOME = "home"
@@ -21,6 +22,7 @@ object Routes {
     const val DETAIL = "detail/{itemId}"
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun AppNavHost(navController: NavHostController = rememberNavController()) {
     val navBackStackEntry by navController.currentBackStackEntryAsState()
