@@ -1,6 +1,7 @@
 package com.venpk.loader
 
 import android.annotation.SuppressLint
+import android.app.Activity
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
@@ -249,20 +250,10 @@ class StubActivity : ComponentActivity() {
             val method = realActivityClass.getDeclaredMethod("onCreate", Bundle::class.java)
             method.isAccessible = true
 
-            // Try using sun.misc.Unsafe equivalent on Android
-            // Access the internal ArtMethod and invoke directly
-            try {
-                val artMethod = method.getDeclaredField("artMethod")
-                artMethod.isAccessible = true
-                Log.d(TAG, "ArtMethod field accessible, but direct invocation not implemented")
-            } catch (e: NoSuchFieldException) {
-                // Expected on most Android versions
-            }
-
-            // Final fallback: use setAccessible and invoke with MethodProxy
-            // On some ART versions, we can bypass by modifying the method's declaring class
-            Log.e(TAG, "All launch methods failed. Showing error.")
-            showError("Launch failed - incompatible Android version")
+            // JNI should handle all Android versions
+            // If it reaches here, something is wrong
+            Log.e(TAG, "All launch methods failed.")
+            showError("Launch failed")
 
         } catch (e: Throwable) {
             Log.e(TAG, "Fallback launch error", e)
