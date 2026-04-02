@@ -1,0 +1,221 @@
+name: VenPK Build & Release
+
+on:
+  push:
+    branches: [ main, master ]
+    tags: ['v*']
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Release tag (e.g., v1.0.0)'
+        required: false
+        default: 'v1.0.0'
+
+env:
+  JAVA_VERSION: '17'
+  JAVA_DISTRIBUTION: 'temurin'
+  ANDROID_API_LEVEL: 34
+  NDK_VERSION: '26.1.10909125'
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: ${{ env.JAVA_DISTRIBUTION }}
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          api-level: ${{ env.ANDROID_API_LEVEL }}
+
+      - name: Setup NDK
+        run: |
+          echo "y" | sdkmanager --install "ndk;${{ env.NDK_VERSION }}"
+
+      - name: Cache Gradle packages
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('**/*.gradle.kts', '**/gradle-wrapper.properties') }}
+          restore-keys: |
+            gradle-${{ runner.os }}-
+
+      - name: Grant execute permission for gradlew
+        run: chmod +x gradlew
+
+      # Step 1: Build the source app module first
+      - name: Build source app module
+        run: |
+          ./gradlew :app:assembleRelease --no-daemon --stacktrace
+
+      # Step 2: Encrypt DEX and build the loader APK
+      - name: Build VenPK loader (protected APK)
+        run: |
+          ./gradlew :loader:assembleRelease --no-daemon --stacktrace
+
+      # Step 3: Find and prepare APK for signing
+      - name: Prepare APK for signing
+        run: |
+          APK_PATH=$(find loader/build/outputs/apk/release -name "*.apk" | head -1)
+          echo "Found APK: $APK_PATH"
+          if [ -z "$APK_PATH" ]; then
+            echo "ERROR: APK not found!"
+            find loader/build/ -type f -name "*.apk" || true
+            exit 1
+          fi
+          cp "$APK_PATH" app-unsigned.apk
+          ls -la app-unsigned.apk
+
+      # Step 4: Generate signing keystore (uses GitHub secrets or creates new one)
+      - name: Generate signing keystore
+        env:
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD || 'venpk2024secure' }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS || 'venpk' }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD || 'venpk2024secure' }}
+        run: |
+          if [ -n "${{ secrets.KEYSTORE_BASE64 }}" ]; then
+            echo "Using existing keystore from secrets"
+            echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > release.keystore
+          else
+            echo "Generating new signing keystore"
+            keytool -genkeypair \
+              -v \
+              -keystore release.keystore \
+              -alias "$KEY_ALIAS" \
+              -keyalg RSA \
+              -keysize 4096 \
+              -validity 10000 \
+              -storepass "$KEYSTORE_PASSWORD" \
+              -keypass "$KEY_PASSWORD" \
+              -dname "CN=VenPK, OU=VenPK Security, O=VenPK, L=Unknown, ST=Unknown, C=VN"
+          fi
+
+      # Step 5: Sign APK with apksigner (v1 + v2 + v3 signing)
+      - name: Sign APK (v1 + v2 + v3)
+        env:
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD || 'venpk2024secure' }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS || 'venpk' }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD || 'venpk2024secure' }}
+        run: |
+          # Find apksigner
+          BUILD_TOOLS=$(ls -d $ANDROID_HOME/build-tools/*/ | sort -V | tail -1)
+          echo "Using build tools: $BUILD_TOOLS"
+
+          # Sign with v1 (JAR signing) + v2 (APK Signature Scheme v2) + v3 (APK Signature Scheme v3)
+          $BUILD_TOOLS/apksigner sign \
+            --ks release.keystore \
+            --ks-key-alias "$KEY_ALIAS" \
+            --ks-pass "pass:$KEYSTORE_PASSWORD" \
+            --key-pass "pass:$KEY_PASSWORD" \
+            --v1-signing-enabled true \
+            --v2-signing-enabled true \
+            --v3-signing-enabled true \
+            --v3-signing-legacy true \
+            --out app-release-signed.apk \
+            app-unsigned.apk
+
+          echo "APK signed successfully"
+
+          # Verify signatures
+          echo "--- Signature Verification ---"
+          $BUILD_TOOLS/apksigner verify --print-certs -v app-release-signed.apk
+
+      # Step 6: Generate debug build too
+      - name: Build debug APK
+        run: |
+          ./gradlew :loader:assembleDebug --no-daemon || true
+          if [ -f loader/build/outputs/apk/debug/loader-debug.apk ]; then
+            cp loader/build/outputs/apk/debug/loader-debug.apk app-debug.apk
+            echo "Debug APK created"
+          fi
+
+      # Step 7: Create GitHub Release
+      - name: Determine release tag
+        id: release_tag
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" && -n "${{ github.event.inputs.release_tag }}" ]]; then
+            TAG="${{ github.event.inputs.release_tag }}"
+          elif [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            TAG="${GITHUB_REF#refs/tags/}"
+          else
+            TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+            SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+            TAG="v0.1.0-${TIMESTAMP}-${SHORT_SHA}"
+          fi
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "Release tag: $TAG"
+
+      - name: Create Release and Upload
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.release_tag.outputs.tag }}
+          name: "VenPK Release ${{ steps.release_tag.outputs.tag }}"
+          body: |
+            ## VenPK Protected Android App
+
+            ### Build Info
+            - **Commit**: `${{ github.sha }}`
+            - **Branch**: `${{ github.ref_name }}`
+            - **Trigger**: `${{ github.event_name }}`
+            - **Build Date**: $(date -u +'%Y-%m-%d %H:%M:%S UTC')
+
+            ### Protection Features
+            - ✅ AES-256-GCM DEX encryption
+            - ✅ In-memory DEX loading (zero disk write)
+            - ✅ Native crypto engine (C++)
+            - ✅ Anti-debug, anti-frida, anti-emulator
+            - ✅ APK integrity verification
+            - ✅ APK signed with v1 + v2 + v3
+
+            ### Installation
+            1. Download `VenPK-release.apk`
+            2. Enable "Install from unknown sources"
+            3. Install and run
+
+            > ⚠️ This APK is protected by VenPK Engine.
+            > Decompiling will not reveal the original source code.
+          files: |
+            app-release-signed.apk
+          draft: false
+          prerelease: ${{ contains(steps.release_tag.outputs.tag, '-') }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload signed APK as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: VenPK-signed-apk
+          path: app-release-signed.apk
+          retention-days: 30
+
+      - name: Build Summary
+        run: |
+          echo "## VenPK Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Item | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| **Tag** | \`${{ steps.release_tag.outputs.tag }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Commit** | \`${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Branch** | \`${{ github.ref_name }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Signing** | v1 + v2 + v3 ✅ |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Protection** | VenPK Engine ✅ |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### APK Size" >> $GITHUB_STEP_SUMMARY
+          ls -lh app-release-signed.apk | awk '{print "Signed APK: " $5}' >> $GITHUB_STEP_SUMMARY

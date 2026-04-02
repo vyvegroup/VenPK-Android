@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Shield icon for VenPK -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M54,18L26,32v22c0,17.4 11.8,33.7 28,38 16.2,-4.3 28,-20.6 28,-38V32L54,18z"/>
+    <path
+        android:fillColor="#1B6B4A"
+        android:pathData="M54,28L36,37v16c0,12 8,23.4 18,26.5 10,-3.1 18,-14.5 18,-26.5V37L54,28z"/>
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M54,40l-4,8h8l-10,14 2,-8h-8z"/>
+</vector>
