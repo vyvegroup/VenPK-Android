@@ -30,8 +30,8 @@
 static volatile int g_security_ok = 0;
 static volatile int g_key_released = 0;
 
-// Access master key from venpk_crypto.cpp
-extern uint8_t* vpk_get_master_key_ptr(void);
+// Access master key from venpk_crypto.cpp (must match extern "C" linkage)
+extern "C" uint8_t* vpk_get_master_key_ptr(void);
 
 // Forward declarations
 static int run_all_security_checks(JNIEnv *env, jobject context);
