@@ -1,24 +1,31 @@
 package com.venpk.loader
 
 import android.annotation.SuppressLint
-import android.app.Activity
-import android.content.Intent
 import android.os.Bundle
 import android.util.Log
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
 import dalvik.system.InMemoryDexClassLoader
-import java.io.ByteArrayInputStream
 import java.nio.ByteBuffer
 import javax.crypto.Cipher
 import javax.crypto.SecretKey
 import javax.crypto.spec.GCMParameterSpec
 import javax.crypto.spec.SecretKeySpec
 
-class StubActivity : Activity() {
+/**
+ * StubActivity - The entry point of the VenPK-protected APK.
+ *
+ * This activity decrypts the real app's DEX bytecode, loads it into memory,
+ * and uses reflection method hijacking to run the real Activity's onCreate()
+ * on itself. The real Activity's Compose UI renders within this StubActivity's
+ * window - no separate Activity launch is needed.
+ */
+class StubActivity : ComponentActivity() {
 
     companion object {
         private const val TAG = "VenPK"
         private const val PAYLOAD_ASSET = "venpk_payload.bin"
-        private const val REAL_APP_CLASS = "com.venpk.app.VenPKApp"
         private const val REAL_ACTIVITY_CLASS = "com.venpk.app.MainActivity"
         private const val GCM_NONCE_LEN = 12
         private const val GCM_TAG_LEN = 128
@@ -77,17 +84,17 @@ class StubActivity : Activity() {
                 return
             }
 
-            // Step 7: Launch the real application activity
-            Log.d(TAG, "Launching real activity...")
-            launchRealActivity(classLoader)
+            // Step 7: Load the real Activity and hijack its onCreate to run on THIS activity
+            Log.d(TAG, "Launching real app via reflection method hijacking...")
+            launchRealApp(classLoader, savedInstanceState)
 
-            // Secure cleanup - zero key from memory
+            // Secure cleanup
             keyBytes.fill(0)
             decryptedDex.fill(0)
 
         } catch (e: Throwable) {
             Log.e(TAG, "VenPK runtime error", e)
-            showError("Runtime error: ${e.javaClass.simpleName}")
+            showError("Runtime error: ${e.javaClass.simpleName}: ${e.message}")
         }
     }
 
@@ -109,11 +116,6 @@ class StubActivity : Activity() {
         }
     }
 
-    /**
-     * Get decryption key from native engine.
-     * Native code performs all security checks (anti-debug, anti-frida, integrity)
-     * before releasing the key. If any check fails, returns null.
-     */
     private fun obtainDecryptionKey(): ByteArray? {
         return try {
             nativeGetKey()
@@ -123,11 +125,6 @@ class StubActivity : Activity() {
         }
     }
 
-    /**
-     * AES-256-GCM decryption using Java Cipher API.
-     * The payload format is: nonce(12) + ciphertext + GCM tag(16)
-     * GCM tag is appended by the Cipher API automatically.
-     */
     private fun decryptAES256GCM(encrypted: ByteArray, key: ByteArray): ByteArray? {
         return try {
             if (encrypted.size < GCM_NONCE_LEN + GCM_TAG_LEN) {
@@ -135,9 +132,7 @@ class StubActivity : Activity() {
                 return null
             }
 
-            // Extract nonce (first 12 bytes)
             val nonce = encrypted.copyOfRange(0, GCM_NONCE_LEN)
-            // Extract ciphertext + tag (remaining bytes)
             val ciphertextWithTag = encrypted.copyOfRange(GCM_NONCE_LEN, encrypted.size)
 
             val secretKey: SecretKey = SecretKeySpec(key, "AES")
@@ -155,17 +150,11 @@ class StubActivity : Activity() {
         }
     }
 
-    /**
-     * Parse multi-dex payload.
-     * Format: [4-byte size][dex data][4-byte size][dex data]...
-     * Returns list of individual DEX byte arrays.
-     */
     private fun parseMultiDex(data: ByteArray): List<ByteArray> {
         val entries = mutableListOf<ByteArray>()
         var offset = 0
 
         while (offset < data.size - 4) {
-            // Read 4-byte big-endian size
             val size = ((data[offset].toInt() and 0xFF) shl 24) or
                     ((data[offset + 1].toInt() and 0xFF) shl 16) or
                     ((data[offset + 2].toInt() and 0xFF) shl 8) or
@@ -178,7 +167,6 @@ class StubActivity : Activity() {
             offset += size
         }
 
-        // If no valid header found, treat entire data as single dex
         if (entries.isEmpty()) {
             entries.add(data)
         }
@@ -186,18 +174,11 @@ class StubActivity : Activity() {
         return entries
     }
 
-    /**
-     * Create InMemoryDexClassLoader - loads DEX directly into memory
-     * without writing any files to disk. This is the core of VenPK's
-     * zero-disk protection.
-     */
     private fun createMemoryClassLoader(dexEntries: List<ByteArray>): ClassLoader? {
         return try {
-            // Convert ByteArray to ByteBuffer for InMemoryDexClassLoader
             val buffers = dexEntries.map { dex ->
                 ByteBuffer.wrap(dex)
             }
-            // Use all DEX buffers
             InMemoryDexClassLoader(
                 buffers.toTypedArray(),
                 classLoader
@@ -208,29 +189,53 @@ class StubActivity : Activity() {
         }
     }
 
-    private fun launchRealActivity(classLoader: ClassLoader) {
+    /**
+     * Launch the real app using REFLECTION METHOD HIJACKING.
+     *
+     * Instead of creating a new Activity instance (which requires fragile Activity.attach()),
+     * we call the real MainActivity's onCreate() method directly on THIS StubActivity instance.
+     *
+     * This works because:
+     * 1. StubActivity extends ComponentActivity (same as real MainActivity)
+     * 2. The real onCreate() uses `this` only as a ComponentActivity
+     * 3. Compose's setContent {} works on any ComponentActivity
+     * 4. Class references in the real DEX bytecode are resolved via InMemoryDexClassLoader
+     */
+    @SuppressLint("DiscouragedPrivateApi")
+    private fun launchRealApp(classLoader: ClassLoader, savedInstanceState: Bundle?) {
         try {
             // Load the real Activity class from the decrypted DEX
-            val activityClass = classLoader.loadClass(REAL_ACTIVITY_CLASS)
+            val realActivityClass = classLoader.loadClass(REAL_ACTIVITY_CLASS)
+            Log.d(TAG, "Loaded real activity class: ${realActivityClass.name}")
 
-            // Create intent targeting the loaded activity
-            val intent = Intent(this, activityClass).apply {
-                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                addFlags(Intent.FLAG_ACTIVITY_CLEAR_TASK)
-                // Pass original intent data if any
-                putExtras(getIntent().extras ?: android.os.Bundle())
-            }
+            // Method hijacking: call the real Activity's onCreate on THIS instance.
+            // The method will execute as if `this` is a MainActivity, but it's actually
+            // the StubActivity. Since both extend ComponentActivity, all super calls,
+            // enableEdgeToEdge(), and setContent {} work correctly.
+            val onCreateMethod = realActivityClass.getDeclaredMethod("onCreate", Bundle::class.java)
+            onCreateMethod.isAccessible = true
 
-            startActivity(intent)
-            overridePendingTransition(0, 0)
-            finish()
-            Log.d(TAG, "Real activity launched successfully")
+            Log.d(TAG, "Invoking real onCreate via method hijacking...")
+            onCreateMethod.invoke(this, savedInstanceState)
+
+            Log.d(TAG, "✅ Real app launched successfully via method hijacking")
+
         } catch (e: ClassNotFoundException) {
             Log.e(TAG, "Real activity class not found in decrypted DEX: $REAL_ACTIVITY_CLASS", e)
-            showError("Application class not found")
+            showError("Application class not found in payload")
+        } catch (e: NoSuchMethodException) {
+            Log.e(TAG, "onCreate method not found on real activity", e)
+            showError("Application method not found")
+        } catch (e: java.lang.reflect.InvocationTargetException) {
+            val cause = e.targetException
+            Log.e(TAG, "Real activity onCreate threw exception: ${cause?.javaClass?.simpleName}: ${cause?.message}", cause)
+            showError("App error: ${cause?.javaClass?.simpleName}: ${cause?.message}")
+        } catch (e: NoClassDefFoundError) {
+            Log.e(TAG, "Class not found during execution - missing dependency: ${e.message}", e)
+            showError("Missing dependency: ${e.message}")
         } catch (e: Throwable) {
             Log.e(TAG, "Failed to launch real activity", e)
-            showError("Launch failed")
+            showError("Launch failed: ${e.javaClass.simpleName}: ${e.message}")
         }
     }
 
@@ -272,9 +277,5 @@ class StubActivity : Activity() {
         }
     }
 
-    /**
-     * Native method: returns 32-byte AES-256 key after security verification.
-     * Returns null if any security check fails (anti-debug, anti-frida, integrity, etc.)
-     */
     private external fun nativeGetKey(): ByteArray?
 }

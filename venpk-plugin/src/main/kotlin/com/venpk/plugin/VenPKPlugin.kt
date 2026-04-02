@@ -1,6 +1,7 @@
 package com.venpk.plugin
 
 import com.android.build.gradle.AppExtension
+import org.gradle.api.GradleException
 import org.gradle.api.Plugin
 import org.gradle.api.Project
 
@@ -23,7 +24,7 @@ class VenPKPlugin : Plugin<Project> {
 
             project.logger.lifecycle("[VenPK] Registering VenPK encrypt tasks for ${project.name}")
 
-            // Register encrypt task (release) - use configure with receiver lambda
+            // Register encrypt task (release)
             val encryptRelease = project.tasks.register(
                 "venpkEncryptDex",
                 VenPKEncryptTask::class.java
@@ -65,12 +66,31 @@ class VenPKPlugin : Plugin<Project> {
 
                     if (payloadFile.exists()) {
                         payloadFile.copyTo(assetsDir.resolve(extension.assetName), overwrite = true)
-                        project.logger.lifecycle("[VenPK] Prepared assets: ${payloadFile.length()} bytes")
+                        project.logger.lifecycle("[VenPK] ✅ Prepared assets: ${payloadFile.length()} bytes → ${assetsDir.resolve(extension.assetName).absolutePath}")
                     } else {
-                        project.logger.warn("[VenPK] Encrypted payload not found at ${payloadFile.absolutePath}")
-                        project.logger.warn("[VenPK] Build the source module first: ./gradlew :${extension.sourceModule}:assembleRelease")
+                        // HARD FAIL - do not silently continue
+                        throw GradleException("""
+                            [VenPK] FATAL: Encrypted payload not found at ${payloadFile.absolutePath}
+                            [VenPK] The venpkEncryptDex task did not produce output.
+                            [VenPK] Make sure the '${extension.sourceModule}' module builds successfully first.
+                            [VenPK] Run: ./gradlew :${extension.sourceModule}:assembleRelease
+                        """.trimIndent())
                     }
                 }
+            }
+
+            // Wire venpkPrepareAssets into the loader's build lifecycle
+            // This ensures the payload is always prepared before the APK is built
+            project.tasks.matching {
+                it.name == "mergeReleaseAssets" || it.name == "processReleaseManifest"
+            }.configureEach {
+                dependsOn(prepareAssets)
+            }
+
+            project.tasks.matching {
+                it.name == "mergeDebugAssets" || it.name == "processDebugManifest"
+            }.configureEach {
+                dependsOn(project.tasks.named("venpkEncryptDexDebug"))
             }
         }
     }

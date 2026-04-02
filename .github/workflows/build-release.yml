@@ -67,34 +67,86 @@ jobs:
         run: |
           ./gradlew :app:assembleRelease --no-daemon --stacktrace
 
+      # Step 1b: Verify DEX files were produced
+      - name: Verify DEX output
+        run: |
+          echo "=== Searching for DEX files in app/build ==="
+          find app/build -name "classes*.dex" -type f 2>/dev/null | head -20 || echo "NO DEX FILES FOUND"
+          echo ""
+          echo "=== DEX directory listing ==="
+          find app/build/intermediates/dex -type f -name "*.dex" 2>/dev/null | head -20 || echo "No DEX in intermediates/dex"
+          echo ""
+          echo "=== app/build intermediates structure ==="
+          find app/build/intermediates -type d -maxdepth 4 2>/dev/null | head -30 || echo "No intermediates dir"
+
       # Step 2: Encrypt the app module DEX files using VenPK engine
       - name: Encrypt DEX with VenPK engine
         run: |
-          echo "=== Step 2a: Run VenPK DEX encryption ==="
-          ./gradlew :loader:venpkPrepareAssets --no-daemon --stacktrace --info
-          echo ""
-          echo "=== Verifying encrypted payload ==="
-          ls -la loader/src/main/assets/venpk_payload.bin 2>/dev/null || echo "Payload not found - will build without encryption"
+          echo "=== Running VenPK DEX encryption ==="
+          ./gradlew :loader:venpkPrepareAssets --no-daemon --stacktrace --info 2>&1 | tee encrypt-log.txt
 
-      # Step 2b: Build the loader APK (with encrypted payload in assets)
+      # Step 2b: HARD VERIFY - payload MUST exist
+      - name: Verify encrypted payload (MUST SUCCEED)
+        run: |
+          echo "=== Checking for encrypted payload ==="
+          if [ -f "loader/src/main/assets/venpk_payload.bin" ]; then
+            SIZE=$(stat -c%s "loader/src/main/assets/venpk_payload.bin")
+            echo "✅ Payload found: $SIZE bytes"
+            echo ""
+            # Verify VPK1 header
+            HEADER=$(xxd -l 4 -p "loader/src/main/assets/venpk_payload.bin")
+            echo "Header: $HEADER"
+            if [ "$HEADER" != "56304b31" ]; then
+              echo "❌ ERROR: Invalid payload header! Expected VPK1"
+              exit 1
+            fi
+            echo "✅ Payload header valid (VPK1)"
+          else
+            echo "❌ FATAL: Payload file not found at loader/src/main/assets/venpk_payload.bin"
+            echo "The VenPK encryption step failed to produce the payload."
+            echo "Check the encrypt-log.txt for details."
+            exit 1
+          fi
+
+      # Step 2c: Create assets placeholder if missing
+      - name: Ensure assets directory exists
+        run: |
+          mkdir -p loader/src/main/assets
+          # Double check the payload is there
+          test -f loader/src/main/assets/venpk_payload.bin
+
+      # Step 3: Build the loader APK (with encrypted payload in assets)
       - name: Build VenPK loader (protected APK)
         run: |
           ./gradlew :loader:assembleRelease --no-daemon --stacktrace
 
-      # Step 3: Find and prepare APK for signing
-      - name: Prepare APK for signing
+      # Step 4: Verify APK contains payload
+      - name: Verify APK contains encrypted payload
         run: |
           APK_PATH=$(find loader/build/outputs/apk/release -name "*.apk" | head -1)
           echo "Found APK: $APK_PATH"
           if [ -z "$APK_PATH" ]; then
-            echo "ERROR: APK not found!"
-            find loader/build/ -type f -name "*.apk" || true
+            echo "❌ ERROR: APK not found!"
+            find loader/build/ -type f -name "*.apk" 2>/dev/null || true
             exit 1
           fi
+
+          # List assets inside the APK to verify payload is included
+          echo "=== Assets in APK ==="
+          unzip -l "$APK_PATH" | grep -E "assets/|venpk_payload" || echo "No assets found in APK"
+
+          # Check specifically for the payload
+          if unzip -l "$APK_PATH" | grep -q "venpk_payload.bin"; then
+            echo "✅ Encrypted payload is inside the APK"
+          else
+            echo "❌ FATAL: venpk_payload.bin is NOT inside the APK!"
+            exit 1
+          fi
+
           cp "$APK_PATH" app-unsigned.apk
           ls -la app-unsigned.apk
 
-      # Step 4: Generate signing keystore (uses GitHub secrets or creates new one)
+      # Step 5: Generate signing keystore
       - name: Generate signing keystore
         env:
           KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD || 'venpk2024secure' }}
@@ -118,18 +170,16 @@ jobs:
               -dname "CN=VenPK, OU=VenPK Security, O=VenPK, L=Unknown, ST=Unknown, C=VN"
           fi
 
-      # Step 5: Sign APK with apksigner (v1 + v2 + v3 signing)
+      # Step 6: Sign APK with apksigner (v1 + v2 + v3 signing)
       - name: Sign APK (v1 + v2 + v3)
         env:
           KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD || 'venpk2024secure' }}
           KEY_ALIAS: ${{ secrets.KEY_ALIAS || 'venpk' }}
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD || 'venpk2024secure' }}
         run: |
-          # Find apksigner
           BUILD_TOOLS=$(ls -d $ANDROID_HOME/build-tools/*/ | sort -V | tail -1)
           echo "Using build tools: $BUILD_TOOLS"
 
-          # Sign with v1 (JAR signing) + v2 (APK Signature Scheme v2) + v3 (APK Signature Scheme v3)
           $BUILD_TOOLS/apksigner sign \
             --ks release.keystore \
             --ks-key-alias "$KEY_ALIAS" \
@@ -143,20 +193,10 @@ jobs:
 
           echo "APK signed successfully"
 
-          # Verify signatures
           echo "--- Signature Verification ---"
           $BUILD_TOOLS/apksigner verify --print-certs -v app-release-signed.apk
 
-      # Step 6: Generate debug build too
-      - name: Build debug APK
-        run: |
-          ./gradlew :loader:assembleDebug --no-daemon || true
-          if [ -f loader/build/outputs/apk/debug/loader-debug.apk ]; then
-            cp loader/build/outputs/apk/debug/loader-debug.apk app-debug.apk
-            echo "Debug APK created"
-          fi
-
-      # Step 7: Create GitHub Release
+      # Step 7: Determine release tag
       - name: Determine release tag
         id: release_tag
         run: |
@@ -167,11 +207,12 @@ jobs:
           else
             TIMESTAMP=$(date +%Y%m%d-%H%M%S)
             SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
-            TAG="v0.1.0-${TIMESTAMP}-${SHORT_SHA}"
+            TAG="v1.0.0-${TIMESTAMP}-${SHORT_SHA}"
           fi
           echo "tag=$TAG" >> $GITHUB_OUTPUT
           echo "Release tag: $TAG"
 
+      # Step 8: Create GitHub Release
       - name: Create Release and Upload
         uses: softprops/action-gh-release@v2
         with:
@@ -208,6 +249,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.PAT_TOKEN || secrets.GITHUB_TOKEN }}
 
+      # Step 9: Upload artifact
       - name: Upload signed APK as artifact
         uses: actions/upload-artifact@v4
         with:
@@ -215,6 +257,7 @@ jobs:
           path: app-release-signed.apk
           retention-days: 30
 
+      # Step 10: Build summary
       - name: Build Summary
         run: |
           echo "## VenPK Build Summary" >> $GITHUB_STEP_SUMMARY
@@ -226,6 +269,7 @@ jobs:
           echo "| **Branch** | \`${{ github.ref_name }}\` |" >> $GITHUB_STEP_SUMMARY
           echo "| **Signing** | v1 + v2 + v3 ✅ |" >> $GITHUB_STEP_SUMMARY
           echo "| **Protection** | VenPK Engine ✅ |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Payload** | Embedded ✅ |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### APK Size" >> $GITHUB_STEP_SUMMARY
           ls -lh app-release-signed.apk | awk '{print "Signed APK: " $5}' >> $GITHUB_STEP_SUMMARY

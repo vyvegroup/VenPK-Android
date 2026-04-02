@@ -1,6 +1,7 @@
 package com.venpk.plugin
 
 import org.gradle.api.DefaultTask
+import org.gradle.api.GradleException
 import org.gradle.api.file.DirectoryProperty
 import org.gradle.api.provider.Property
 import org.gradle.api.tasks.*
@@ -30,30 +31,82 @@ abstract class VenPKEncryptTask : DefaultTask() {
 
     @TaskAction
     fun execute() {
+        logger.lifecycle("[VenPK] ═══════════════════════════════════════════")
         logger.lifecycle("[VenPK] Starting DEX encryption for variant: ${variantName.get()}")
+        logger.lifecycle("[VenPK] Source module: ${sourceModule.get()}")
 
         val sourceDir = findSourceDexDir()
         if (sourceDir == null) {
-            logger.warn("[VenPK] Source DEX directory not found. Skipping encryption.")
-            logger.warn("[VenPK] Build the '${sourceModule.get()}' module first.")
-            return
+            logger.lifecycle("[VenPK] ─── Scanning app/build for ANY .dex files ───")
+            // Deep scan: walk the entire app/build directory
+            val appBuildDir = File(project.rootDir, "${sourceModule.get()}/build")
+            if (appBuildDir.exists()) {
+                val allDexFiles = mutableListOf<File>()
+                appBuildDir.walkTopDown()
+                    .filter { it.isFile && it.name.endsWith(".dex") && it.name.startsWith("classes") }
+                    .forEach { allDexFiles.add(it) }
+
+                if (allDexFiles.isNotEmpty()) {
+                    logger.lifecycle("[VenPK] Deep scan found ${allDexFiles.size} DEX file(s):")
+                    allDexFiles.forEach { f ->
+                        logger.lifecycle("[VenPK]   → ${f.absolutePath} (${f.length()} bytes)")
+                    }
+
+                    // Use the directory containing the first DEX file
+                    val parentDir = allDexFiles.first().parentFile
+                    logger.lifecycle("[VenPK] Using DEX directory: ${parentDir?.absolutePath}")
+                    encryptFromDir(parentDir!!)
+                    return
+                }
+            }
+
+            // List what actually exists for debugging
+            logger.lifecycle("[VenPK] ─── Debug: app/build contents ───")
+            val appBuildDir2 = File(project.rootDir, "${sourceModule.get()}/build")
+            if (appBuildDir2.exists()) {
+                appBuildDir2.walkTopDown().maxDepth(3)
+                    .filter { it.isDirectory }
+                    .forEach { dir ->
+                        val dexCount = dir.listFiles { f -> f.name.endsWith(".dex") }?.size ?: 0
+                        if (dexCount > 0 || dir.name == "dex" || dir.name == "intermediates") {
+                            logger.lifecycle("[VenPK]   ${dir.absolutePath} (dex files: $dexCount)")
+                        }
+                    }
+            } else {
+                logger.lifecycle("[VenPK]   ERROR: ${appBuildDir2.absolutePath} DOES NOT EXIST")
+                logger.lifecycle("[VenPK]   Did you run :${sourceModule.get()}:assemble${variantName.get().replaceFirstChar { it.uppercase() }} first?")
+            }
+
+            throw GradleException("""
+                [VenPK] FATAL: Source DEX directory not found!
+                [VenPK] Make sure the '${sourceModule.get()}' module has been built first.
+                [VenPK] Run: ./gradlew :${sourceModule.get()}:assemble${variantName.get().replaceFirstChar { it.uppercase() }}
+            """.trimIndent())
         }
 
+        encryptFromDir(sourceDir)
+    }
+
+    private fun encryptFromDir(sourceDir: File) {
         val dexFiles = sourceDir.listFiles { file ->
-            file.name.endsWith(".dex") && file.isFile
+            file.name.endsWith(".dex") && file.isFile && file.name.startsWith("classes")
         }
 
         if (dexFiles.isNullOrEmpty()) {
-            logger.warn("[VenPK] No DEX files found in $sourceDir")
-            return
+            throw GradleException("""
+                [VenPK] FATAL: No DEX files found in ${sourceDir.absolutePath}
+                [VenPK] Directory contents: ${sourceDir.listFiles()?.map { "${it.name} (${it.length()})" }?.joinToString(", ")}
+            """.trimIndent())
         }
 
-        logger.lifecycle("[VenPK] Found ${dexFiles.size} DEX file(s) to encrypt")
+        logger.lifecycle("[VenPK] Found ${dexFiles.size} DEX file(s) to encrypt:")
+        dexFiles.sortedBy { it.name }.forEach { f ->
+            logger.lifecycle("[VenPK]   → ${f.name} (${f.length()} bytes)")
+        }
 
         // Concatenate all dex files with size headers
         val allDex = ByteArrayOutputStream()
         for (dexFile in dexFiles.sortedBy { it.name }) {
-            logger.lifecycle("[VenPK] Adding: ${dexFile.name} (${dexFile.length()} bytes)")
             FileInputStream(dexFile).use { input ->
                 val size = dexFile.length()
                 // Write 4-byte big-endian size header
@@ -83,7 +136,8 @@ abstract class VenPKEncryptTask : DefaultTask() {
             out.write(encrypted)
         }
 
-        logger.lifecycle("[VenPK] Encrypted payload written to: ${outputFile.absolutePath} (${outputFile.length()} bytes)")
+        logger.lifecycle("[VenPK] ✅ Encrypted payload written: ${outputFile.absolutePath} (${outputFile.length()} bytes)")
+        logger.lifecycle("[VenPK] ═══════════════════════════════════════════")
 
         // Secure cleanup
         plainDex.fill(0)
@@ -97,18 +151,28 @@ abstract class VenPKEncryptTask : DefaultTask() {
         val buildDir = File(project.rootDir, "$moduleName/build")
         val capitalizedVariant = variant.replaceFirstChar { it.uppercase() }
 
-        // Known paths where merged DEX files are output by AGP
+        // Known paths where merged DEX files are output by AGP (comprehensive list)
         val possiblePaths = listOf(
+            // AGP 8.x primary paths
             "$buildDir/intermediates/dex/$variant/mergeDex$capitalizedVariant/out",
             "$buildDir/intermediates/dex/$variant/mergeProjectDex/$variant/out",
             "$buildDir/intermediates/dex/$variant/mergeDex/out",
-            "$buildDir/outputs/dex/$variant/mergeDex$capitalizedVariant/out"
+            "$buildDir/intermediates/dex/$variant/mergeExtDex$capitalizedVariant/out",
+            "$buildDir/intermediates/dex/$variant/mergeLibDex$capitalizedVariant/out",
+            // AGP 7.x fallback paths
+            "$buildDir/intermediates/transforms/dex_builder/$variant/0",
+            "$buildDir/intermediates/transforms/dex_merger/$variant/0",
+            // Legacy paths
+            "$buildDir/outputs/dex/$variant/mergeDex$capitalizedVariant/out",
+            "$buildDir/intermediates/dex/$variant/out",
+            // Direct path without variant subfolder
+            "$buildDir/intermediates/dex/$variant/mergeDex$capitalizedVariant"
         )
 
         for (path in possiblePaths) {
             val dir = File(path)
             if (dir.exists() && dir.isDirectory) {
-                val dexFiles = dir.listFiles { f -> f.name.endsWith(".dex") }
+                val dexFiles = dir.listFiles { f -> f.name.endsWith(".dex") && f.name.startsWith("classes") }
                 if (!dexFiles.isNullOrEmpty()) {
                     logger.lifecycle("[VenPK] Found DEX files at: $dir")
                     return dir
@@ -116,13 +180,15 @@ abstract class VenPKEncryptTask : DefaultTask() {
             }
         }
 
-        // Fallback: walk intermediates looking for dex directories
+        // Fallback: walk intermediates looking for any directory containing dex files
         val intermediatesDir = File(buildDir, "intermediates")
         if (intermediatesDir.exists()) {
+            logger.lifecycle("[VenPK] Primary paths not found, scanning intermediates...")
             val found = intermediatesDir.walkTopDown()
-                .filter { it.isDirectory && it.name == "out" }
+                .filter { it.isDirectory }
                 .firstOrNull { dir ->
-                    dir.listFiles { f -> f.name.endsWith(".dex") }?.isNotEmpty() == true
+                    val dexFiles = dir.listFiles { f -> f.name.endsWith(".dex") && f.name.startsWith("classes") }
+                    !dexFiles.isNullOrEmpty()
                 }
             if (found != null) {
                 logger.lifecycle("[VenPK] Found DEX files (fallback) at: $found")
