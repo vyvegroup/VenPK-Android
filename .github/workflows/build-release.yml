@@ -96,7 +96,7 @@ jobs:
             # Verify VPK1 header
             HEADER=$(xxd -l 4 -p "loader/src/main/assets/venpk_payload.bin")
             echo "Header: $HEADER"
-            if [ "$HEADER" != "56304b31" ]; then
+            if [ "$HEADER" != "56504b31" ]; then
               echo "❌ ERROR: Invalid payload header! Expected VPK1"
               exit 1
             fi
