@@ -18,6 +18,7 @@ env:
   JAVA_DISTRIBUTION: 'temurin'
   ANDROID_API_LEVEL: 34
   NDK_VERSION: '26.1.10909125'
+  CMAKE_VERSION: '3.22.1'
 
 jobs:
   build-and-release:
@@ -46,6 +47,7 @@ jobs:
       - name: Setup NDK
         run: |
           echo "y" | sdkmanager --install "ndk;${{ env.NDK_VERSION }}"
+          echo "y" | sdkmanager --install "cmake;${{ env.CMAKE_VERSION }}"
 
       - name: Cache Gradle packages
         uses: actions/cache@v4
