@@ -3,8 +3,6 @@ package com.venpk.plugin
 import com.android.build.gradle.AppExtension
 import org.gradle.api.Plugin
 import org.gradle.api.Project
-import org.gradle.api.tasks.TaskProvider
-import java.io.File
 
 open class VenPKPlugin : Plugin<Project> {
 
@@ -46,21 +44,18 @@ open class VenPKPlugin : Plugin<Project> {
             }
 
             // Register helper task to copy encrypted payload to assets
-            project.tasks.register("venpkPrepareAssets") { prepareTask ->
-                prepareTask.dependsOn(encryptTask)
-                prepareTask.group = "venpk"
-                prepareTask.description = "Copies encrypted DEX to loader assets directory"
+            project.tasks.register("venpkPrepareAssets") {
+                it.dependsOn(encryptTask)
+                it.group = "venpk"
+                it.description = "Copies encrypted DEX to loader assets directory"
 
-                prepareTask.doLast {
-                    val payloadFile = File(
-                        project.layout.buildDirectory.get().asFile,
-                        "venpk/release/${extension.assetName}"
-                    )
-                    val assetsDir = File(project.projectDir, "src/main/assets")
+                it.doLast {
+                    val payloadFile = project.layout.buildDirectory.get().asFile.resolve("venpk/release/${extension.assetName}")
+                    val assetsDir = project.projectDir.resolve("src/main/assets")
                     assetsDir.mkdirs()
 
                     if (payloadFile.exists()) {
-                        payloadFile.copyTo(File(assetsDir, extension.assetName), overwrite = true)
+                        payloadFile.copyTo(assetsDir.resolve(extension.assetName), overwrite = true)
                         project.logger.lifecycle("[VenPK] Prepared assets: ${payloadFile.length()} bytes")
                     } else {
                         project.logger.warn("[VenPK] Encrypted payload not found at ${payloadFile.absolutePath}")
