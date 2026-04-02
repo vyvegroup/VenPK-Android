@@ -138,7 +138,6 @@ jobs:
             --v1-signing-enabled true \
             --v2-signing-enabled true \
             --v3-signing-enabled true \
-            --v3-signing-legacy true \
             --out app-release-signed.apk \
             app-unsigned.apk
 
