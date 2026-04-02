@@ -60,10 +60,8 @@ Java_com_venpk_loader_VenPKLoaderApp_nativeInitSecurity(JNIEnv *env, jobject thi
     int result = run_all_security_checks(env, thiz);
     if (result != 0) {
         LOGW("Security checks returned warnings: %d", result);
-        g_security_ok = 1; // Still allow, just warn
-    } else {
-        g_security_ok = 1;
     }
+    g_security_ok = 1;
 
     // Initialize obfuscation engine
     vpk_obfuscate_init();
@@ -76,13 +74,11 @@ JNIEXPORT jbyteArray JNICALL
 Java_com_venpk_loader_StubActivity_nativeGetKey(JNIEnv *env, jobject thiz) {
     LOGI("Key request received");
 
-    // Only release key if security checks passed
     if (!g_security_ok) {
         LOGE("Security not initialized - denying key request");
         return nullptr;
     }
 
-    // One-time key release - prevent repeated extraction
     if (g_key_released) {
         LOGE("Key already released - denying duplicate request");
         return nullptr;
@@ -96,18 +92,15 @@ Java_com_venpk_loader_StubActivity_nativeGetKey(JNIEnv *env, jobject thiz) {
         return nullptr;
     }
 
-    // Get master key from crypto engine
     uint8_t *master_key = vpk_get_master_key_ptr();
     if (!master_key) {
         LOGE("Master key not available");
         return nullptr;
     }
 
-    // Copy key to output buffer
     uint8_t key_copy[32];
     memcpy(key_copy, master_key, 32);
 
-    // Create Java byte array
     jbyteArray result = env->NewByteArray(32);
     if (!result) {
         LOGE("Failed to allocate key array");
@@ -124,6 +117,98 @@ Java_com_venpk_loader_StubActivity_nativeGetKey(JNIEnv *env, jobject thiz) {
     return result;
 }
 
+/**
+ * JNI method: Calls the real Activity's onCreate() on StubActivity instance.
+ *
+ * Uses CallNonvirtualVoidMethod to directly invoke the method implementation
+ * from the specified class, bypassing Java's receiver type check.
+ *
+ * Java's Method.invoke() checks that obj is an instanceof the declaring class.
+ * Since StubActivity is NOT a subclass of the real MainActivity, Method.invoke()
+ * throws IllegalArgumentException. CallNonvirtualVoidMethod bypasses this check
+ * on Android ART by directly invoking the bytecode from the specified class.
+ *
+ * This works because:
+ * 1. Both StubActivity and the real MainActivity extend ComponentActivity
+ * 2. The real MainActivity.onCreate() only uses 'this' as ComponentActivity
+ *    (calls super.onCreate(), enableEdgeToEdge(), setContent {...})
+ * 3. No Kotlin CHECKCAST of 'this' to MainActivity exists in the bytecode
+ * 4. ART's CallNonvirtualVoidMethod does not verify receiver type
+ */
+JNIEXPORT jboolean JNICALL
+Java_com_venpk_loader_StubActivity_nativeCallActivityOnCreate(
+    JNIEnv *env, jobject thiz, jclass activity_class, jobject saved_instance_state) {
+
+    LOGI("nativeCallActivityOnCreate: invoking onCreate via CallNonvirtualVoidMethod");
+
+    // Get the onCreate(Bundle) method from the real Activity class
+    jmethodID on_create_method = env->GetMethodID(
+        activity_class, "onCreate", "(Landroid/os/Bundle;)V");
+
+    if (on_create_method == nullptr) {
+        LOGE("onCreate method not found in activity class");
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        return JNI_FALSE;
+    }
+
+    LOGI("Found onCreate method, calling via CallNonvirtualVoidMethod...");
+
+    // CallNonvirtualVoidMethod invokes the method directly from activity_class
+    // on the thiz object (StubActivity), bypassing virtual dispatch and
+    // the receiver instanceof check that Method.invoke() performs.
+    env->CallNonvirtualVoidMethod(thiz, activity_class, on_create_method, saved_instance_state);
+
+    // Check for Java exceptions
+    if (env->ExceptionCheck()) {
+        jthrowable exception = env->ExceptionOccurred();
+        env->ExceptionDescribe();
+        env->ExceptionClear();
+
+        // Get exception message
+        jclass exClass = env->GetObjectClass(exception);
+        jmethodID getMessage = env->GetMethodID(exClass, "getMessage", "()Ljava/lang/String;");
+        if (getMessage) {
+            jstring msg = (jstring)env->CallObjectMethod(exception, getMessage);
+            if (msg) {
+                const char *msgStr = env->GetStringUTFChars(msg, nullptr);
+                LOGE("onCreate threw exception: %s", msgStr);
+                env->ReleaseStringUTFChars(msg, msgStr);
+            }
+        }
+        env->DeleteLocalRef(exception);
+        env->DeleteLocalRef(exClass);
+
+        return JNI_FALSE;
+    }
+
+    LOGI("✅ onCreate invoked successfully via JNI");
+    return JNI_TRUE;
+}
+
+/**
+ * Fallback: Try to call the method using internal ART APIs.
+ * On newer Android versions where CallNonvirtualVoidMethod checks types,
+ * we attempt to use reflection to access ArtMethod directly.
+ */
+JNIEXPORT jboolean JNICALL
+Java_com_venpk_loader_StubActivity_nativeCallActivityOnCreateFallback(
+    JNIEnv *env, jobject thiz, jmethodID method_id, jobject saved_instance_state) {
+
+    LOGI("Attempting fallback invocation...");
+
+    // Try direct invocation via the method pointer
+    // On ART, jmethodID is a pointer to ArtMethod
+    // We can try to invoke it directly, but this is highly version-dependent
+
+    // Alternative approach: use the JNI CallVoidMethod with a different strategy
+    // We temporarily replace the class in the object's class pointer
+    // This is very hacky and version-dependent
+
+    // For now, just log and return false
+    LOGE("Fallback invocation not available on this ART version");
+    return JNI_FALSE;
+}
+
 JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *reserved) {
     LOGI("VenPK native library loading...");
 
@@ -133,12 +218,10 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *reserved) {
         return JNI_ERR;
     }
 
-    // Anti-tamper: prevent library unloading
-    // The VM handle keeps the library in memory
     (void)vm;
     (void)reserved;
 
-    LOGI("VenPK native library loaded (v1.0.0)");
+    LOGI("VenPK native library loaded (v1.1.0)");
     return JNI_VERSION_1_6;
 }
 
@@ -158,18 +241,14 @@ static int run_all_security_checks(JNIEnv *env, jobject context) {
 }
 
 static void vpk_anti_debug_check(void) {
-    // Check 1: ptrace anti-attach
-    // This prevents debuggers from attaching to the process
     static volatile int ptrace_done = 0;
     if (!ptrace_done) {
         if (ptrace(PTRACE_TRACEME, 0, 1, 0) == -1) {
             LOGW("Anti-debug: ptrace TRACEME failed - debugger may be attached");
-            // Don't set g_security_ok = 0, just warn
         }
         ptrace_done = 1;
     }
 
-    // Check 2: /proc/self/status TracerPid
     FILE *f = fopen("/proc/self/status", "r");
     if (f) {
         char line[256];
@@ -184,14 +263,9 @@ static void vpk_anti_debug_check(void) {
         }
         fclose(f);
     }
-
-    // Check 3: JDWP (Java Debug Wire Protocol)
-    // Check if android.os.Debug.isDebuggerConnected
-    // This is done from the Java side in VenPKEngine.kt
 }
 
 static void vpk_anti_frida_check(void) {
-    // Check 1: /proc/self/maps for frida-agent
     FILE *f = fopen("/proc/self/maps", "r");
     if (f) {
         char line[512];
@@ -206,9 +280,6 @@ static void vpk_anti_frida_check(void) {
         fclose(f);
     }
 
-    // Check 2: Check for frida-server listening ports
-    // Frida default port is 27042
-    // We check by attempting to connect (simple approach)
     int sock = socket(AF_INET, SOCK_STREAM, 0);
     if (sock >= 0) {
         struct sockaddr_in addr;
@@ -217,7 +288,6 @@ static void vpk_anti_frida_check(void) {
         addr.sin_port = htons(27042);
         addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
 
-        // Non-blocking check
         int flags = fcntl(sock, F_GETFL, 0);
         fcntl(sock, F_SETFL, flags | O_NONBLOCK);
 
@@ -229,7 +299,6 @@ static void vpk_anti_frida_check(void) {
         }
     }
 
-    // Check 3: /tmp/frida-*.so files
     const char *frida_paths[] = {
         "/tmp/frida-agent.so",
         "/tmp/frida-server",
@@ -245,14 +314,8 @@ static void vpk_anti_frida_check(void) {
 }
 
 static void vpk_anti_emulator_check(void) {
-    // Check hardware properties for emulator signatures
     FILE *f;
     char buf[256];
-    const char *emulator_props[] = {
-        "ro.hardware", "ro.product.model", "ro.product.board",
-        "ro.product.manufacturer", "ro.build.display.id",
-        nullptr
-    };
     const char *emulator_signatures[] = {
         "goldfish", "ranchu", "vbox", "genymotion",
         "nox", "bluestacks", "memu", "androvm",
@@ -260,13 +323,8 @@ static void vpk_anti_emulator_check(void) {
         nullptr
     };
 
-    for (int i = 0; emulator_props[i] != nullptr; i++) {
-        char path[128];
-        snprintf(path, sizeof(path), "/system/build.prop");
-        // Use __system_property_get equivalent via getprop
-        f = fopen(path, "r");
-        if (!f) continue;
-
+    f = fopen("/system/build.prop", "r");
+    if (f) {
         while (fgets(buf, sizeof(buf), f)) {
             for (int j = 0; emulator_signatures[j] != nullptr; j++) {
                 if (strcasestr(buf, emulator_signatures[j]) != nullptr) {
@@ -278,7 +336,6 @@ static void vpk_anti_emulator_check(void) {
         fclose(f);
     }
 
-    // Check for QEMU-specific files
     const char *qemu_files[] = {
         "/dev/qemu_pipe", "/system/lib/libc_malloc_debug_qemu.so",
         "/sys/qemu_trace", "/system/bin/qemu-props",
@@ -292,7 +349,6 @@ static void vpk_anti_emulator_check(void) {
 }
 
 static void vpk_integrity_check(JNIEnv *env, jobject context) {
-    // Get Context class and call getPackageManager()
     jclass contextClass = env->GetObjectClass(context);
     if (!contextClass) return;
 
@@ -309,7 +365,6 @@ static void vpk_integrity_check(JNIEnv *env, jobject context) {
         return;
     }
 
-    // Get package name
     jmethodID getPackageName = env->GetMethodID(contextClass, "getPackageName", "()Ljava/lang/String;");
     if (!getPackageName) {
         env->DeleteLocalRef(pm);
@@ -324,17 +379,14 @@ static void vpk_integrity_check(JNIEnv *env, jobject context) {
         return;
     }
 
-    // Get package info with signatures
     jclass pmClass = env->GetObjectClass(pm);
-    static const int GET_SIGNATURES = 0x40; // PackageManager.GET_SIGNATURES
+    static const int GET_SIGNATURES = 0x40;
     jmethodID getPackageInfo = env->GetMethodID(pmClass, "getPackageInfo",
         "(Ljava/lang/String;I)Landroid/content/pm/PackageInfo;");
 
     if (getPackageInfo) {
         jobject pkgInfo = env->CallObjectMethod(pm, getPackageInfo, packageName, GET_SIGNATURES);
         if (pkgInfo) {
-            // Could verify signature hash here
-            // For now, just verify signatures exist
             env->DeleteLocalRef(pkgInfo);
             LOGI("APK integrity: signatures present");
         } else {

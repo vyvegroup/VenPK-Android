@@ -1,11 +1,12 @@
 package com.venpk.loader
 
 import android.annotation.SuppressLint
+import android.content.ComponentName
+import android.content.Context
+import android.content.Intent
 import android.os.Bundle
 import android.util.Log
 import androidx.activity.ComponentActivity
-import androidx.activity.compose.setContent
-import androidx.activity.enableEdgeToEdge
 import dalvik.system.InMemoryDexClassLoader
 import java.nio.ByteBuffer
 import javax.crypto.Cipher
@@ -14,12 +15,11 @@ import javax.crypto.spec.GCMParameterSpec
 import javax.crypto.spec.SecretKeySpec
 
 /**
- * StubActivity - The entry point of the VenPK-protected APK.
+ * StubActivity - VenPK entry point.
  *
- * This activity decrypts the real app's DEX bytecode, loads it into memory,
- * and uses reflection method hijacking to run the real Activity's onCreate()
- * on itself. The real Activity's Compose UI renders within this StubActivity's
- * window - no separate Activity launch is needed.
+ * Decrypts the real app's DEX bytecode in memory, loads it via InMemoryDexClassLoader,
+ * then uses JNI (CallNonvirtualVoidMethod) to call the real Activity's onCreate() on
+ * this StubActivity instance, bypassing Java's receiver type check.
  */
 class StubActivity : ComponentActivity() {
 
@@ -27,6 +27,7 @@ class StubActivity : ComponentActivity() {
         private const val TAG = "VenPK"
         private const val PAYLOAD_ASSET = "venpk_payload.bin"
         private const val REAL_ACTIVITY_CLASS = "com.venpk.app.MainActivity"
+        private const val REAL_APP_CLASS = "com.venpk.app.VenPKApp"
         private const val GCM_NONCE_LEN = 12
         private const val GCM_TAG_LEN = 128
     }
@@ -48,45 +49,60 @@ class StubActivity : ComponentActivity() {
 
             // Step 2: Validate payload header
             if (payloadData.size < 4 || String(payloadData, 0, 4, Charsets.UTF_8) != "VPK1") {
-                Log.e(TAG, "Invalid payload header - corrupted or tampered")
+                Log.e(TAG, "Invalid payload header")
                 showError("Application data corrupted")
                 return
             }
 
-            // Step 3: Get decryption key from native (runs security checks first)
+            // Step 3: Get decryption key from native
             val keyBytes = obtainDecryptionKey()
             if (keyBytes == null || keyBytes.size != 32) {
-                Log.e(TAG, "Failed to obtain decryption key - security check may have failed")
+                Log.e(TAG, "Failed to obtain decryption key")
                 showError("Security verification failed")
                 return
             }
-            Log.d(TAG, "Decryption key obtained from native engine")
+            Log.d(TAG, "Decryption key obtained")
 
-            // Step 4: Decrypt payload using Java Cipher (AES-256-GCM)
+            // Step 4: Decrypt payload
             val encryptedData = payloadData.copyOfRange(4, payloadData.size)
             val decryptedDex = decryptAES256GCM(encryptedData, keyBytes)
             if (decryptedDex == null || decryptedDex.isEmpty()) {
-                Log.e(TAG, "AES-256-GCM decryption failed - authentication tag mismatch")
+                Log.e(TAG, "AES-256-GCM decryption failed")
                 showError("Decryption failed")
                 return
             }
-            Log.d(TAG, "Dex decrypted: ${decryptedDex.size} bytes")
+            Log.d(TAG, "DEX decrypted: ${decryptedDex.size} bytes")
 
-            // Step 5: Parse multi-dex from payload (4-byte size header per dex)
+            // Step 5: Parse multi-dex
             val dexEntries = parseMultiDex(decryptedDex)
             Log.d(TAG, "Parsed ${dexEntries.size} DEX entries")
 
-            // Step 6: Load classes from decrypted DEX into memory
+            // Step 6: Create in-memory class loader
             val classLoader = createMemoryClassLoader(dexEntries)
             if (classLoader == null) {
-                Log.e(TAG, "Failed to create in-memory class loader")
                 showError("Class loading failed")
                 return
             }
 
-            // Step 7: Load the real Activity and hijack its onCreate to run on THIS activity
-            Log.d(TAG, "Launching real app via reflection method hijacking...")
-            launchRealApp(classLoader, savedInstanceState)
+            // Step 7: Initialize real Application class (for VenPKApp.instance etc.)
+            initRealApplication(classLoader)
+
+            // Step 8: Inject Activity fields so framework works correctly
+            injectActivityFields(classLoader)
+
+            // Step 9: Call real Activity's onCreate via JNI (bypasses receiver type check)
+            Log.d(TAG, "Launching real app via JNI...")
+            val launched = nativeCallActivityOnCreate(
+                classLoader.loadClass(REAL_ACTIVITY_CLASS),
+                savedInstanceState
+            )
+
+            if (!launched) {
+                Log.e(TAG, "JNI launch failed, trying fallback...")
+                tryFallbackLaunch(classLoader, savedInstanceState)
+            } else {
+                Log.d(TAG, "✅ Real app launched successfully via JNI")
+            }
 
             // Secure cleanup
             keyBytes.fill(0)
@@ -117,9 +133,7 @@ class StubActivity : ComponentActivity() {
     }
 
     private fun obtainDecryptionKey(): ByteArray? {
-        return try {
-            nativeGetKey()
-        } catch (e: Throwable) {
+        return try { nativeGetKey() } catch (e: Throwable) {
             Log.e(TAG, "Native key retrieval failed", e)
             null
         }
@@ -127,25 +141,14 @@ class StubActivity : ComponentActivity() {
 
     private fun decryptAES256GCM(encrypted: ByteArray, key: ByteArray): ByteArray? {
         return try {
-            if (encrypted.size < GCM_NONCE_LEN + GCM_TAG_LEN) {
-                Log.e(TAG, "Encrypted data too short: ${encrypted.size}")
-                return null
-            }
-
+            if (encrypted.size < GCM_NONCE_LEN + GCM_TAG_LEN) return null
             val nonce = encrypted.copyOfRange(0, GCM_NONCE_LEN)
-            val ciphertextWithTag = encrypted.copyOfRange(GCM_NONCE_LEN, encrypted.size)
-
-            val secretKey: SecretKey = SecretKeySpec(key, "AES")
+            val ct = encrypted.copyOfRange(GCM_NONCE_LEN, encrypted.size)
             val cipher = Cipher.getInstance("AES/GCM/NoPadding")
-            val gcmSpec = GCMParameterSpec(GCM_TAG_LEN, nonce)
-            cipher.init(Cipher.DECRYPT_MODE, secretKey, gcmSpec)
-
-            cipher.doFinal(ciphertextWithTag)
-        } catch (e: javax.crypto.AEADBadTagException) {
-            Log.e(TAG, "GCM authentication FAILED - data integrity compromised!")
-            null
+            cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), GCMParameterSpec(GCM_TAG_LEN, nonce))
+            cipher.doFinal(ct)
         } catch (e: Throwable) {
-            Log.e(TAG, "AES decryption error: ${e.javaClass.simpleName}: ${e.message}")
+            Log.e(TAG, "Decryption error: ${e.javaClass.simpleName}: ${e.message}")
             null
         }
     }
@@ -153,34 +156,24 @@ class StubActivity : ComponentActivity() {
     private fun parseMultiDex(data: ByteArray): List<ByteArray> {
         val entries = mutableListOf<ByteArray>()
         var offset = 0
-
         while (offset < data.size - 4) {
             val size = ((data[offset].toInt() and 0xFF) shl 24) or
                     ((data[offset + 1].toInt() and 0xFF) shl 16) or
                     ((data[offset + 2].toInt() and 0xFF) shl 8) or
                     (data[offset + 3].toInt() and 0xFF)
             offset += 4
-
             if (size <= 0 || offset + size > data.size) break
-
             entries.add(data.copyOfRange(offset, offset + size))
             offset += size
         }
-
-        if (entries.isEmpty()) {
-            entries.add(data)
-        }
-
+        if (entries.isEmpty()) entries.add(data)
         return entries
     }
 
     private fun createMemoryClassLoader(dexEntries: List<ByteArray>): ClassLoader? {
         return try {
-            val buffers = dexEntries.map { dex ->
-                ByteBuffer.wrap(dex)
-            }
             InMemoryDexClassLoader(
-                buffers.toTypedArray(),
+                dexEntries.map { ByteBuffer.wrap(it) }.toTypedArray(),
                 classLoader
             )
         } catch (e: Throwable) {
@@ -190,52 +183,108 @@ class StubActivity : ComponentActivity() {
     }
 
     /**
-     * Launch the real app using REFLECTION METHOD HIJACKING.
-     *
-     * Instead of creating a new Activity instance (which requires fragile Activity.attach()),
-     * we call the real MainActivity's onCreate() method directly on THIS StubActivity instance.
-     *
-     * This works because:
-     * 1. StubActivity extends ComponentActivity (same as real MainActivity)
-     * 2. The real onCreate() uses `this` only as a ComponentActivity
-     * 3. Compose's setContent {} works on any ComponentActivity
-     * 4. Class references in the real DEX bytecode are resolved via InMemoryDexClassLoader
+     * Initialize the real app's Application class.
+     * The real app might reference VenPKApp.instance, so we initialize it.
      */
-    @SuppressLint("DiscouragedPrivateApi")
-    private fun launchRealApp(classLoader: ClassLoader, savedInstanceState: Bundle?) {
+    @SuppressLint("DiscouragedPrivateApi", "PrivateApi")
+    private fun initRealApplication(classLoader: ClassLoader) {
         try {
-            // Load the real Activity class from the decrypted DEX
-            val realActivityClass = classLoader.loadClass(REAL_ACTIVITY_CLASS)
-            Log.d(TAG, "Loaded real activity class: ${realActivityClass.name}")
+            val realAppClass = classLoader.loadClass(REAL_APP_CLASS)
+            val realApp = realAppClass.getDeclaredConstructor().newInstance()
 
-            // Method hijacking: call the real Activity's onCreate on THIS instance.
-            // The method will execute as if `this` is a MainActivity, but it's actually
-            // the StubActivity. Since both extend ComponentActivity, all super calls,
-            // enableEdgeToEdge(), and setContent {} work correctly.
-            val onCreateMethod = realActivityClass.getDeclaredMethod("onCreate", Bundle::class.java)
-            onCreateMethod.isAccessible = true
+            // Inject the base context into the real Application
+            try {
+                val attachBase = android.app.Application::class.java.getDeclaredMethod(
+                    "attachBaseContext", Context::class.java
+                )
+                attachBase.isAccessible = true
+                attachBase.invoke(realApp, baseContext)
+            } catch (e: Throwable) {
+                Log.d(TAG, "attachBaseContext on real app skipped: ${e.message}")
+            }
 
-            Log.d(TAG, "Invoking real onCreate via method hijacking...")
-            onCreateMethod.invoke(this, savedInstanceState)
-
-            Log.d(TAG, "✅ Real app launched successfully via method hijacking")
-
-        } catch (e: ClassNotFoundException) {
-            Log.e(TAG, "Real activity class not found in decrypted DEX: $REAL_ACTIVITY_CLASS", e)
-            showError("Application class not found in payload")
-        } catch (e: NoSuchMethodException) {
-            Log.e(TAG, "onCreate method not found on real activity", e)
-            showError("Application method not found")
-        } catch (e: java.lang.reflect.InvocationTargetException) {
-            val cause = e.targetException
-            Log.e(TAG, "Real activity onCreate threw exception: ${cause?.javaClass?.simpleName}: ${cause?.message}", cause)
-            showError("App error: ${cause?.javaClass?.simpleName}: ${cause?.message}")
-        } catch (e: NoClassDefFoundError) {
-            Log.e(TAG, "Class not found during execution - missing dependency: ${e.message}", e)
-            showError("Missing dependency: ${e.message}")
+            // Call onCreate
+            try {
+                val onCreate = android.app.Application::class.java.getDeclaredMethod("onCreate")
+                onCreate.isAccessible = true
+                onCreate.invoke(realApp)
+                Log.d(TAG, "Real Application class initialized: ${realAppClass.name}")
+            } catch (e: Throwable) {
+                Log.d(TAG, "Real app onCreate skipped: ${e.message}")
+            }
         } catch (e: Throwable) {
-            Log.e(TAG, "Failed to launch real activity", e)
+            Log.d(TAG, "Real app init skipped: ${e.message}")
+        }
+    }
+
+    /**
+     * Inject critical Activity fields so the framework treats this
+     * StubActivity as if it were the real Activity.
+     */
+    @SuppressLint("DiscouragedPrivateApi", "PrivateApi")
+    private fun injectActivityFields(classLoader: ClassLoader) {
+        try {
+            // Set mComponent to point to the real Activity class
+            val mComponent = ComponentName(packageName, REAL_ACTIVITY_CLASS)
+            setField(Activity::class.java, this, "mComponent", mComponent)
+
+            // Set mIntent with the correct component
+            val newIntent = Intent(intent).apply {
+                component = mComponent
+            }
+            setField(Activity::class.java, this, "mIntent", newIntent)
+        } catch (e: Throwable) {
+            Log.d(TAG, "Field injection skipped: ${e.message}")
+        }
+    }
+
+    /**
+     * Fallback: If JNI launch fails, try using the internal ART reflection
+     * mechanism to bypass the type check.
+     */
+    @SuppressLint("DiscouragedPrivateApi", "BlockedPrivateApi", "PrivateApi")
+    private fun tryFallbackLaunch(classLoader: ClassLoader, savedInstanceState: Bundle?) {
+        try {
+            val realActivityClass = classLoader.loadClass(REAL_ACTIVITY_CLASS)
+            val method = realActivityClass.getDeclaredMethod("onCreate", Bundle::class.java)
+            method.isAccessible = true
+
+            // Try using sun.misc.Unsafe equivalent on Android
+            // Access the internal ArtMethod and invoke directly
+            try {
+                val artMethod = method.getDeclaredField("artMethod")
+                artMethod.isAccessible = true
+                Log.d(TAG, "ArtMethod field accessible, but direct invocation not implemented")
+            } catch (e: NoSuchFieldException) {
+                // Expected on most Android versions
+            }
+
+            // Final fallback: use setAccessible and invoke with MethodProxy
+            // On some ART versions, we can bypass by modifying the method's declaring class
+            Log.e(TAG, "All launch methods failed. Showing error.")
+            showError("Launch failed - incompatible Android version")
+
+        } catch (e: Throwable) {
+            Log.e(TAG, "Fallback launch error", e)
             showError("Launch failed: ${e.javaClass.simpleName}: ${e.message}")
+        }
+    }
+
+    private fun setField(clazz: Class<*>, target: Any, fieldName: String, value: Any?) {
+        try {
+            val field = clazz.getDeclaredField(fieldName)
+            field.isAccessible = true
+            field.set(target, value)
+        } catch (e: NoSuchFieldException) {
+            try {
+                val field = clazz.superclass.getDeclaredField(fieldName)
+                field.isAccessible = true
+                field.set(target, value)
+            } catch (e2: Throwable) {
+                Log.d(TAG, "Field $fieldName not found")
+            }
+        } catch (e: Throwable) {
+            Log.d(TAG, "Failed to set field $fieldName: ${e.message}")
         }
     }
 
@@ -276,6 +325,14 @@ class StubActivity : ComponentActivity() {
             Log.e(TAG, "Cannot show error UI", e)
         }
     }
+
+    /**
+     * JNI method: Calls the real Activity's onCreate() on this StubActivity
+     * using CallNonvirtualVoidMethod, which bypasses Java's receiver type check.
+     * On Android ART, CallNonvirtualVoidMethod directly invokes the method
+     * from the specified class without checking if the receiver is an instance.
+     */
+    private external fun nativeCallActivityOnCreate(activityClass: Class<*>, savedInstanceState: Bundle?): Boolean
 
     private external fun nativeGetKey(): ByteArray?
 }
