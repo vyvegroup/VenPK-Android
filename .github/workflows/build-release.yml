@@ -65,7 +65,16 @@ jobs:
         run: |
           ./gradlew :app:assembleRelease --no-daemon --stacktrace
 
-      # Step 2: Encrypt DEX and build the loader APK
+      # Step 2: Encrypt the app module DEX files using VenPK engine
+      - name: Encrypt DEX with VenPK engine
+        run: |
+          echo "=== Step 2a: Run VenPK DEX encryption ==="
+          ./gradlew :loader:venpkPrepareAssets --no-daemon --stacktrace --info
+          echo ""
+          echo "=== Verifying encrypted payload ==="
+          ls -la loader/src/main/assets/venpk_payload.bin 2>/dev/null || echo "Payload not found - will build without encryption"
+
+      # Step 2b: Build the loader APK (with encrypted payload in assets)
       - name: Build VenPK loader (protected APK)
         run: |
           ./gradlew :loader:assembleRelease --no-daemon --stacktrace
@@ -196,7 +205,7 @@ jobs:
           draft: false
           prerelease: ${{ contains(steps.release_tag.outputs.tag, '-') }}
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.PAT_TOKEN || secrets.GITHUB_TOKEN }}
 
       - name: Upload signed APK as artifact
         uses: actions/upload-artifact@v4
